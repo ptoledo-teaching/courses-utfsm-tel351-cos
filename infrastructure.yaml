@@ -1,0 +1,674 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TEL351 - HoloNet speech synthesis cost measurement laboratory (us-east-1)
+
+Resources:
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ReportsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  AnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  GeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  AnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AnalyzeReports
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AnalyzerLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ReportsQueue.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub '${ResultsBucket.Arn}/runs/*/inputs/*'
+                  - !Sub '${ResultsBucket.Arn}/runs/*/results/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub '${ResultsBucket.Arn}/runs/*/claims/*'
+                  - !Sub '${ResultsBucket.Arn}/runs/*/results/*'
+                  - !Sub '${ResultsBucket.Arn}/runs/*/audio/*'
+              - Effect: Allow
+                Action: polly:SynthesizeSpeech
+                Resource: '*'
+
+  AnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Synthesize fixed reports with Amazon Polly and record measured usage
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Role: !GetAtt AnalyzerRole.Arn
+      MemorySize: 512
+      Timeout: 120
+      LoggingConfig:
+        LogGroup: !Ref AnalyzerLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+      Code:
+        ZipFile: |
+          """Shared source embedded into both inline Lambda functions by build.py."""
+          import csv
+          import io
+          import json
+          import math
+          import os
+          import re
+          import time
+          import uuid
+          import wave
+          from datetime import datetime, timezone
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          BUCKET = os.environ.get("RESULTS_BUCKET", "")
+          VOICE = "Lupe"
+          SAMPLE_RATE = 16000
+          ENGINES = ("standard", "neural")
+          FORMATS = ("mp3", "pcm")
+          CONFIG = Config(connect_timeout=5, read_timeout=60, retries={"total_max_attempts": 1})
+          s3 = boto3.client("s3", config=CONFIG)
+
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def encode(value):
+              return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+          def put(key, value, **kwargs):
+              return s3.put_object(Bucket=BUCKET, Key=key, Body=encode(value), ContentType="application/json", **kwargs)
+
+
+          def get(key):
+              try:
+                  obj = s3.get_object(Bucket=BUCKET, Key=key)
+              except ClientError as error:
+                  if error.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                      return None
+                  raise
+              with obj["Body"] as body:
+                  return json.loads(body.read())
+
+
+          def run_id(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+                  raise ValueError("runId must be the 32-character identifier returned by generate.")
+              return value
+
+
+          def prefix(value):
+              return "runs/" + run_id(value) + "/"
+
+
+          def emit(value):
+              print(encode(value).decode("utf-8"), flush=True)
+
+          """Appended to common.py in the deployed index module."""
+          polly = boto3.client("polly", config=CONFIG)
+
+
+          def report_identity(record):
+              """Return both correlation IDs only after validating the message contract."""
+              message = json.loads(record["body"])
+              if not isinstance(message, dict):
+                  raise ValueError("Report message must be a JSON object")
+              rid = run_id(message["runId"])
+              report_id = message["reportId"]
+              if not isinstance(report_id, str) or not re.fullmatch(r"report-0[1-5]", report_id):
+                  raise ValueError("Invalid reportId")
+              return {"runId": rid, "reportId": report_id}
+
+
+          def process(record, context):
+              message = report_identity(record)
+              root = prefix(message["runId"])
+              report_id = message["reportId"]
+              invocation = context.aws_request_id
+              claim_key = root + "claims/" + report_id + ".json"
+              result_key = root + "results/" + report_id + ".json"
+              claim = {"runId": message["runId"], "reportId": report_id, "invocationId": invocation, "startedAt": now()}
+              try:
+                  put(claim_key, claim, IfNoneMatch="*")
+              except ClientError as error:
+                  if error.response["Error"]["Code"] not in ("PreconditionFailed", "412", "ConditionalRequestConflict", "409"):
+                      raise
+                  if get(result_key) is None:
+                      raise RuntimeError("Previous attempt has no durable result; no repeated Polly call is allowed.")
+                  emit({**claim, "event": "duplicate_skipped"})
+                  return
+              result = {**claim, "event": "synthesis_result", "status": "FAILED", "requestCharacters": None, "pollyLatencyMs": None, "pollyCalls": 0, "audioBytes": None, "memoryMB": int(os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "512")), "sqsReceiveCount": int(record.get("attributes", {}).get("ApproximateReceiveCount", "1"))}
+              emit({**claim, "event": "synthesis_started"})
+              started = time.monotonic()
+              try:
+                  source = get(root + "inputs/" + report_id + ".json")
+                  if source is None:
+                      raise ValueError("Input object is missing")
+                  engine, output_format = source["engine"], source["outputFormat"]
+                  if engine not in ENGINES or output_format not in FORMATS:
+                      raise ValueError("Unsupported synthesis configuration")
+                  if not isinstance(source["text"], str) or not 1 <= len(source["text"]) <= 3000:
+                      raise ValueError("Report must contain between 1 and 3000 plain-text characters")
+                  result.update({"engine": engine, "voiceId": VOICE, "sampleRate": SAMPLE_RATE, "outputFormat": output_format, "scenario": source["scenario"], "caseId": source["caseId"], "textCharacters": len(source["text"]), "reportBytes": len(source["text"].encode("utf-8"))})
+                  # One SDK attempt, with no silent synthesis retry after an ambiguous result.
+                  result["pollyCalls"] = 1
+                  synthesis_started = time.monotonic()
+                  response = polly.synthesize_speech(Text=source["text"], TextType="text", VoiceId=VOICE, Engine=engine, OutputFormat=output_format, SampleRate=str(SAMPLE_RATE))
+                  result["requestCharacters"] = response.get("RequestCharacters")
+                  with response["AudioStream"] as body:
+                      audio = body.read()
+                  result["pollyLatencyMs"] = round((time.monotonic() - synthesis_started) * 1000, 2)
+                  if not audio:
+                      raise ValueError("Polly returned an empty audio stream")
+                  result["audioBytes"] = len(audio)
+                  extension, content_type = "mp3", "audio/mpeg"
+                  if output_format == "pcm":
+                      # A WAV header makes the returned mono, signed 16-bit PCM playable.
+                      if len(audio) % 2:
+                          raise ValueError("Polly returned an incomplete PCM sample")
+                      result["audioDurationSeconds"] = len(audio) / (SAMPLE_RATE * 2)
+                      stream = io.BytesIO()
+                      with wave.open(stream, "wb") as wav:
+                          wav.setnchannels(1)
+                          wav.setsampwidth(2)
+                          wav.setframerate(SAMPLE_RATE)
+                          wav.writeframes(audio)
+                      audio = stream.getvalue()
+                      extension, content_type = "wav", "audio/wav"
+                  audio_key = root + "audio/" + report_id + "." + extension
+                  s3.put_object(Bucket=BUCKET, Key=audio_key, Body=audio, ContentType=content_type)
+                  result.update({"audioKey": audio_key, "audioObjectBytes": len(audio), "status": "COMPLETED"})
+              except ClientError as error:
+                  result["errorCode"] = error.response["Error"]["Code"]
+                  result["errorMessage"] = error.response["Error"].get("Message", "")[:500]
+              except Exception as error:
+                  result["errorCode"] = type(error).__name__
+                  result["errorMessage"] = str(error)[:500]
+              result.update({"finishedAt": now(), "processingMs": round((time.monotonic() - started) * 1000, 2)})
+              put(result_key, result)
+              # No report text or audio in logs. Original, metadata and audio stay in S3.
+              emit({k: v for k, v in result.items() if k != "errorMessage"})
+
+
+          def handler(event, context):
+              failures = []
+              for record in event.get("Records", []):
+                  try:
+                      process(record, context)
+                  except Exception as error:
+                      entry = {"event": "delivery_error", "invocationId": context.aws_request_id, "messageId": record.get("messageId"), "errorCode": type(error).__name__, "errorMessage": str(error)[:300]}
+                      try:
+                          # Even retries rejected before synthesis incur Lambda usage.
+                          entry.update(report_identity(record))
+                      except (KeyError, TypeError, ValueError):
+                          # Never associate malformed messages with a report's measurements.
+                          pass
+                      emit(entry)
+                      failures.append({"itemIdentifier": record["messageId"]})
+              return {"batchItemFailures": failures}
+
+  QueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ReportsQueue.Arn
+      FunctionName: !Ref AnalyzerFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      ScalingConfig:
+        MaximumConcurrency: 2
+      Enabled: true
+
+  GeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GenerateAndSummarize
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt GeneratorLogGroup.Arn
+              - Effect: Allow
+                Action: logs:FilterLogEvents
+                Resource: !GetAtt AnalyzerLogGroup.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ReportsQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${ResultsBucket.Arn}/runs/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ResultsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: runs/*
+
+  GeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Generate bounded test runs and export measured consumption
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Role: !GetAtt GeneratorRole.Arn
+      MemorySize: 256
+      Timeout: 120
+      LoggingConfig:
+        LogGroup: !Ref GeneratorLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          QUEUE_URL: !Ref ReportsQueue
+          ANALYZER_LOG_GROUP: !Ref AnalyzerLogGroup
+      Code:
+        ZipFile: |
+          """Shared source embedded into both inline Lambda functions by build.py."""
+          import csv
+          import io
+          import json
+          import math
+          import os
+          import re
+          import time
+          import uuid
+          import wave
+          from datetime import datetime, timezone
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          BUCKET = os.environ.get("RESULTS_BUCKET", "")
+          VOICE = "Lupe"
+          SAMPLE_RATE = 16000
+          ENGINES = ("standard", "neural")
+          FORMATS = ("mp3", "pcm")
+          CONFIG = Config(connect_timeout=5, read_timeout=60, retries={"total_max_attempts": 1})
+          s3 = boto3.client("s3", config=CONFIG)
+
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def encode(value):
+              return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+          def put(key, value, **kwargs):
+              return s3.put_object(Bucket=BUCKET, Key=key, Body=encode(value), ContentType="application/json", **kwargs)
+
+
+          def get(key):
+              try:
+                  obj = s3.get_object(Bucket=BUCKET, Key=key)
+              except ClientError as error:
+                  if error.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                      return None
+                  raise
+              with obj["Body"] as body:
+                  return json.loads(body.read())
+
+
+          def run_id(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+                  raise ValueError("runId must be the 32-character identifier returned by generate.")
+              return value
+
+
+          def prefix(value):
+              return "runs/" + run_id(value) + "/"
+
+
+          def emit(value):
+              print(encode(value).decode("utf-8"), flush=True)
+
+          """Five fixed reports with paired short and extended versions, below 3000 characters."""
+          CASES = [
+              {
+                  "id": "relay-temperature",
+                  "brief": "La estación Aurek informa una degradación del enlace del repetidor R-17. La temperatura aumentó de 42 a 79 grados y la pérdida de paquetes alcanzó el 12 por ciento. El ventilador secundario informa cero revoluciones. El enlace de respaldo permanece disponible. No existe autorización para reiniciar el repetidor durante la transmisión de emergencia.",
+                  "context": "El registro anterior al incidente muestra una temperatura estable y pérdidas inferiores al uno por ciento. El aumento comenzó después del cambio de turno, pero no hay evidencia de una modificación de configuración. El ventilador principal sigue informando actividad. El sensor del ventilador secundario entrega cero revoluciones en tres lecturas consecutivas. El equipo de terreno todavía no ha inspeccionado el ventilador ni su alimentación, por lo que no está confirmada la causa física. La estación informa que el enlace de respaldo tiene capacidad disponible, aunque un cambio de ruta debe ser autorizado por operaciones. La transmisión de emergencia tiene prioridad sobre el tráfico ordinario. No se ha medido la temperatura de la sala. El siguiente turno debe revisar el estado del equipo y conservar los registros del incidente.",
+              },
+              {
+                  "id": "clock-drift",
+                  "brief": "La estación Besh detecta que el sincronizador S-4 tiene un desfase de 850 milisegundos respecto de la referencia. Los mensajes llegan completos, pero aparecen fuera de orden. La referencia principal dejó de responder y la secundaria continúa disponible. No se permite modificar manualmente las fechas de los mensajes ni borrar registros.",
+                  "context": "El problema se observó al comparar los registros de recepción de dos estaciones. Ambas conservan los mensajes íntegros y no informan pérdida de paquetes durante el intervalo revisado. La última sincronización satisfactoria con la referencia principal ocurrió antes del inicio del desfase. La referencia secundaria responde a consultas de disponibilidad, pero no se ha comprobado todavía si el sincronizador la está utilizando. El registro de configuración no muestra una modificación autorizada durante el turno. La secuencia original de recepción debe conservarse para permitir una revisión posterior. Operaciones ha solicitado revisar la fuente de sincronización y las condiciones de acceso. Cualquier ajuste debe conservar los registros anteriores y permitir comparar el estado previo con el posterior.",
+              },
+              {
+                  "id": "buffer-pressure",
+                  "brief": "La estación Cresh informa que el concentrador C-8 utiliza el 94 por ciento de su buffer. La entrada aumentó desde 20 hasta 85 reportes por segundo y la salida permanece en 25. No se observan errores de enlace. Los mensajes prioritarios deben conservarse y no está autorizado descartar reportes para liberar espacio.",
+                  "context": "Los reportes provienen de estaciones que enviaron sus registros al finalizar un intervalo de observación. El aumento de entrada se mantuvo durante varias mediciones y el buffer continúa creciendo. El consumidor sigue activo, pero su tasa de salida no aumentó junto con la demanda. El personal no ha medido todavía si el límite proviene del procesador, del almacenamiento o de un servicio dependiente. El enlace conserva su tasa habitual de errores, sin evidencia de una interrupción de conectividad. Existen mensajes de distinta prioridad dentro del buffer. El equipo de operaciones mantiene una revisión de la acumulación y de la capacidad de procesamiento. El siguiente turno debe registrar la evolución de las tasas de entrada y salida antes de modificar la configuración del concentrador.",
+              },
+              {
+                  "id": "expired-identity",
+                  "brief": "La estación Dorn informa que el gateway G-2 rechaza desde las ocho de la mañana las comunicaciones del terminal T-9 por un certificado expirado. Los demás terminales siguen funcionando. La conectividad del terminal está disponible. No se permite desactivar la validación de certificados ni compartir la identidad de otro terminal.",
+                  "context": "El último intercambio aceptado ocurrió antes del cambio de día. Los intentos posteriores alcanzan el gateway y reciben un rechazo explícito, sin evidencia de una interrupción de red. El equipo debe comprobar la fecha de expiración y la correspondencia entre el certificado instalado y la identidad del terminal. Los otros terminales utilizan credenciales independientes y no muestran el mismo error. El procedimiento de renovación debe realizarse mediante el mecanismo autorizado por operaciones y conservar los registros de rechazo. No hay antecedentes suficientes para concluir que exista una intrusión. El equipo de turno debe comprobar nuevamente el acceso después de renovar el certificado y registrar la hora del primer intercambio aceptado.",
+              },
+              {
+                  "id": "storage-pressure",
+                  "brief": "La estación Esk informa que el archivador A-6 tiene el 97 por ciento del almacenamiento ocupado y rechaza nuevos archivos por falta de espacio. Los enlaces están operativos. Un conjunto de respaldos temporales creció durante la última jornada. Los reportes oficiales deben conservarse durante 30 días y todavía no se ha determinado qué archivos pueden eliminarse.",
+                  "context": "Los archivos existentes siguen disponibles para lectura y no se han detectado alteraciones de su contenido. El rechazo ocurre al intentar conservar nuevos reportes. La inspección inicial identifica crecimiento en un directorio de respaldos temporales, pero su nombre no demuestra que todos los archivos sean prescindibles. Parte del almacenamiento corresponde a reportes sujetos a conservación obligatoria y no se ha completado el inventario de fechas. La estación está verificando qué conjuntos explican el crecimiento y qué capacidad adicional podría utilizarse. No existe autorización para eliminar automáticamente el archivo más antiguo. Tampoco se ha confirmado que los respaldos sean duplicados exactos de los reportes oficiales. El objetivo inmediato es recuperar la recepción de nuevos archivos sin perder información que deba conservarse.",
+              },
+          ]
+
+          """Appended to common.py and cases.py in the deployed index module."""
+          sqs = boto3.client("sqs", config=CONFIG)
+          logs = boto3.client("logs", config=Config(connect_timeout=5, read_timeout=10, retries={"total_max_attempts": 1}))
+          QUEUE = os.environ.get("QUEUE_URL", "")
+          LOG_GROUP = os.environ.get("ANALYZER_LOG_GROUP", "")
+          REPORT = re.compile(r"REPORT RequestId:\s*(\S+).*?Duration:\s*([\d.]+) ms.*?Billed Duration:\s*([\d.]+) ms.*?Memory Size:\s*(\d+) MB")
+          REQUEST = re.compile(r"(?:START|END|REPORT) RequestId:\s*(\S+)")
+
+
+          def generate(event):
+              scenario = event.get("scenario")
+              engine = event.get("engine")
+              output_format = event.get("outputFormat")
+              count = event.get("reports")
+              if scenario not in ("brief", "extended") or engine not in ENGINES or output_format not in FORMATS:
+                  raise ValueError("Use scenario brief/extended, engine standard/neural and outputFormat mp3/pcm.")
+              if type(count) is not int or not 1 <= count <= 5:
+                  raise ValueError("reports must be an integer between 1 and 5.")
+              rid = uuid.uuid4().hex
+              root = prefix(rid)
+              manifest = {"schemaVersion": 2, "runId": rid, "createdAt": now(), "createdEpochMs": int(time.time() * 1000), "reports": count, "scenario": scenario, "engine": engine, "outputFormat": output_format, "voiceId": VOICE, "sampleRate": SAMPLE_RATE, "reportIds": [f"report-{i + 1:02}" for i in range(count)]}
+              put(root + "manifest.json", manifest)
+              accepted, uncertain = [], []
+              for report_id, case in zip(manifest["reportIds"], CASES):
+                  source = {"runId": rid, "reportId": report_id, "caseId": case["id"], "scenario": scenario, "engine": engine, "outputFormat": output_format, "text": case["brief"] + ("\n\n" + case["context"] if scenario == "extended" else "")}
+                  put(root + "inputs/" + report_id + ".json", source)
+                  body = json.dumps({"runId": rid, "reportId": report_id})
+                  try:
+                      sent = sqs.send_message(QueueUrl=QUEUE, MessageBody=body)
+                      delivery = {"status": "ACCEPTED", "messageId": sent["MessageId"], "messageBytes": len(body.encode("utf-8"))}
+                      accepted.append(report_id)
+                  except Exception as error:
+                      # A network failure is not proof that SQS rejected the message.
+                      delivery = {"status": "DISPATCH_UNKNOWN", "errorCode": type(error).__name__}
+                      uncertain.append(report_id)
+                  put(root + "dispatch/" + report_id + ".json", delivery)
+              return {"runId": rid, "accepted": len(accepted), "dispatchUnknown": len(uncertain), "prefix": root, "message": "Consultar este runId con action=summary. No volver a generar para consultar el avance."}
+
+
+          def read_logs(manifest):
+              """Bounded retrieval, no Insights queries or synthesis in the summary action."""
+              params = {"logGroupName": LOG_GROUP, "startTime": manifest["createdEpochMs"] - 2000, "endTime": min(int(time.time() * 1000), manifest["createdEpochMs"] + 1800000), "limit": 1000}
+              events, token, complete = [], None, False
+              try:
+                  for _ in range(5):
+                      page = logs.filter_log_events(**params, **({"nextToken": token} if token else {}))
+                      events.extend(page.get("events", []))
+                      token = page.get("nextToken")
+                      if not token:
+                          complete = True
+                          break
+              except ClientError as error:
+                  return [], False, error.response["Error"]["Code"]
+              except Exception as error:
+                  return [], False, type(error).__name__
+              return events, complete, None
+
+
+          def measurements(events, rid, claims):
+              associations = {c["invocationId"]: c["reportId"] for c in claims if c}
+              rows, seen = {}, set()
+              for event in events:
+                  raw = event["message"].strip()
+                  try:
+                      item = json.loads(raw)
+                  except (ValueError, TypeError):
+                      continue
+                  if isinstance(item, dict) and item.get("runId") == rid and item.get("invocationId"):
+                      associations[item["invocationId"]] = item["reportId"]
+              for event in events:
+                  identity = event.get("eventId") or (event.get("logStreamName"), event.get("timestamp"), event["message"])
+                  if identity in seen:
+                      continue
+                  seen.add(identity)
+                  raw = event["message"]
+                  request = REQUEST.search(raw)
+                  iid = request.group(1) if request else None
+                  try:
+                      item = json.loads(raw)
+                      if isinstance(item, dict):
+                          iid = item.get("invocationId", iid)
+                  except (ValueError, TypeError):
+                      pass
+                  if iid not in associations:
+                      continue
+                  row = rows.setdefault(iid, {"runId": rid, "reportId": associations[iid], "invocationId": iid, "billedDurationMs": None, "memoryMB": None, "observedLogBytes": 0})
+                  row["observedLogBytes"] += len(raw.encode("utf-8"))
+                  match = REPORT.search(raw)
+                  if match:
+                      row.update({"billedDurationMs": float(match.group(3)), "memoryMB": int(match.group(4))})
+                      row["gbSeconds"] = row["memoryMB"] / 1024 * row["billedDurationMs"] / 1000
+              for iid, report_id in associations.items():
+                  rows.setdefault(iid, {"runId": rid, "reportId": report_id, "invocationId": iid, "billedDurationMs": None, "memoryMB": None, "observedLogBytes": None})
+              return list(rows.values())
+
+
+          def save_csv(key, rows, fields):
+              stream = io.StringIO(newline="")
+              writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+              writer.writeheader()
+              for row in rows:
+                  # Data fields here are identifiers, controlled labels or numbers, not source text.
+                  writer.writerow({k: "" if row.get(k) is None else row[k] for k in fields})
+              s3.put_object(Bucket=BUCKET, Key=key, Body=stream.getvalue().encode("utf-8-sig"), ContentType="text/csv; charset=utf-8")
+
+
+          def stats(rows, field):
+              values = [r[field] for r in rows if type(r.get(field)) in (int, float)]
+              return {"observed": len(values), "unknown": len(rows) - len(values), "sumKnown": sum(values) if values else None, "meanKnown": sum(values) / len(values) if values else None, "minKnown": min(values) if values else None, "maxKnown": max(values) if values else None}
+
+
+          def summary(event):
+              rid = run_id(event.get("runId"))
+              root = prefix(rid)
+              manifest = get(root + "manifest.json")
+              if manifest is None:
+                  raise ValueError("runId was not found in this stack.")
+              if manifest.get("schemaVersion") != 2:
+                  raise ValueError("This run belongs to a previous laboratory version. Its files remain in S3; use a run generated with the Polly template.")
+              rows, claims = [], []
+              age = time.time() - manifest["createdEpochMs"] / 1000
+              for report_id in manifest["reportIds"]:
+                  claim = get(root + "claims/" + report_id + ".json")
+                  claims.append(claim)
+                  result = get(root + "results/" + report_id + ".json")
+                  if result is None:
+                      status = "PENDING"
+                      if claim and time.time() - datetime.fromisoformat(claim["startedAt"]).timestamp() > 180:
+                          status = "INCOMPLETE"
+                      if age > 900:
+                          status = "INCOMPLETE"
+                      result = {"runId": rid, "reportId": report_id, "status": status, "requestCharacters": None}
+                  rows.append(result)
+              events, log_complete, log_error = read_logs(manifest)
+              invocation_rows = measurements(events, rid, claims)
+              cached = get(root + "telemetry.json") or []
+              by_id = {r["invocationId"]: r for r in cached}
+              for row in invocation_rows:
+                  previous = by_id.get(row["invocationId"], {})
+                  merged = {**previous, **{k: v for k, v in row.items() if v is not None}}
+                  sizes = [r.get("observedLogBytes") for r in (previous, row) if r.get("observedLogBytes") is not None]
+                  merged["observedLogBytes"] = max(sizes) if sizes else None
+                  by_id[row["invocationId"]] = merged
+              invocation_rows = list(by_id.values())
+              put(root + "telemetry.json", invocation_rows)
+              billing_ready = bool(invocation_rows) and log_complete and all(r.get("billedDurationMs") is not None for r in invocation_rows) and len(invocation_rows) >= sum(bool(c) for c in claims)
+              counts = {state.lower(): sum(r["status"] == state for r in rows) for state in ("COMPLETED", "FAILED", "PENDING", "INCOMPLETE")}
+              files = {}
+              for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=root):
+                  files.update({obj["Key"]: obj["Size"] for obj in page.get("Contents", [])})
+              for row in rows:
+                  report_id = row["reportId"]
+                  row["inputObjectBytes"] = files.get(root + "inputs/" + report_id + ".json")
+                  row["claimObjectBytes"] = files.get(root + "claims/" + report_id + ".json")
+                  row["resultObjectBytes"] = files.get(root + "results/" + report_id + ".json")
+                  row["audioObjectBytes"] = files.get(row.get("audioKey"))
+              report_fields = ["runId", "reportId", "caseId", "status", "engine", "voiceId", "sampleRate", "scenario", "outputFormat", "invocationId", "textCharacters", "requestCharacters", "pollyLatencyMs", "processingMs", "pollyCalls", "sqsReceiveCount", "audioBytes", "audioObjectBytes", "audioDurationSeconds", "audioKey", "inputObjectBytes", "claimObjectBytes", "resultObjectBytes", "errorCode"]
+              save_csv(root + "measurements.csv", rows, report_fields)
+              save_csv(root + "invocations.csv", invocation_rows, ["runId", "reportId", "invocationId", "billedDurationMs", "memoryMB", "gbSeconds", "observedLogBytes"])
+              usage_known = all(type(r.get("requestCharacters")) is int and type(r.get("audioObjectBytes")) is int for r in rows)
+              dispatches = [get(root + "dispatch/" + i + ".json") for i in manifest["reportIds"]]
+              answer = {
+                  "runId": rid, "prefix": root, "bucket": BUCKET, **counts,
+                  "engine": manifest["engine"], "voiceId": manifest["voiceId"], "sampleRate": manifest["sampleRate"], "scenario": manifest["scenario"], "outputFormat": manifest["outputFormat"],
+                  "measurementStatus": "READY" if counts["completed"] == len(rows) and billing_ready and usage_known else "PARTIAL",
+                  "logReadComplete": log_complete, "logReadError": log_error, "lambdaBillingAvailable": billing_ready,
+                  "polly": {field: stats(rows, field) for field in ("requestCharacters", "pollyLatencyMs", "audioBytes", "audioObjectBytes")},
+                  "lambda": {field: stats(invocation_rows, field) for field in ("billedDurationMs", "gbSeconds", "observedLogBytes")},
+                  "files": {"reports": root + "measurements.csv", "invocations": root + "invocations.csv", "summary": root + "summary.json"},
+                  "operations": {
+                      "observedAcceptedSends": sum(bool(d) and d.get("status") == "ACCEPTED" for d in dispatches),
+                      "queueMessageContains": "runId and reportId; full reports are stored in S3",
+                      "sqsReceiveAndDelete": "Managed by Lambda; polling and empty receives are not counted by this tool",
+                      "normalS3OperationsPerReport": "4 PUT (input, claim, audio, result), 1 GET (input); audio downloads, duplicates and errors add operations",
+                      "auxiliaryExcluded": "Manifests, dispatch records, summary GET/LIST/PUT and log retrieval",
+                      "observedLogBytesScope": "UTF-8 message bytes linked to invocations, not invoice ingestion bytes; INIT_START and service overhead excluded",
+                  },
+              }
+              answer["errors"] = [{"reportId": r["reportId"], "code": r.get("errorCode"), "message": r.get("errorMessage", "")} for r in rows if r["status"] == "FAILED"]
+              if counts["failed"] or counts["incomplete"]:
+                  answer["message"] = "Hay reportes fallidos o sin resultado definitivo. Revisar errors y los archivos de results antes de generar otra prueba. Repetir summary no vuelve a sintetizar ni corrige fallas de Polly."
+              elif counts["pending"]:
+                  answer["message"] = "La síntesis sigue pendiente. Repetir únicamente summary con el mismo runId."
+              elif answer["measurementStatus"] != "READY":
+                  answer["message"] = "Los audios están disponibles, pero faltan mediciones. Revisar logReadError y los campos desconocidos; si faltan logs, repetir summary. No volver a generar para esperar los registros."
+              else:
+                  answer["message"] = "Descargar los CSV y revisar los audios desde S3. Las mediciones están completas."
+              put(root + "summary.json", answer)
+              return answer
+
+
+          def handler(event, context):
+              if not isinstance(event, dict):
+                  raise ValueError("The test event must be a JSON object.")
+              if event.get("action") == "generate":
+                  return generate(event)
+              if event.get("action") == "summary":
+                  return summary(event)
+              raise ValueError("action must be generate or summary.")
+
+  MeasurementsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub '${AWS::StackName}-measurements'
+      LogGroupNames:
+        - !Ref AnalyzerLogGroup
+      QueryString: |
+        fields @timestamp, @message, coalesce(invocationId, @requestId) as invocation
+        | filter ispresent(invocation)
+        | stats latest(runId) as run, latest(reportId) as report, latest(event) as lastEvent, latest(status) as lastStatus, max(requestCharacters) as characters, max(audioObjectBytes) as audioSize, max(pollyLatencyMs) as synthesisLatencyMs, max(@billedDuration) as billedMs, max(@memorySize) / 1000000 as allocatedMemoryMB by invocation
+        | filter ispresent(run)
+        | sort run asc, report asc
+        | limit 200
+
+Outputs:
+  GeneratorFunctionName:
+    Description: Invoke this function from Test to generate or summarize a run
+    Value: !Ref GeneratorFunction
+  SynthesizerFunctionName:
+    Description: Function consuming reports and generating audio with Polly
+    Value: !Ref AnalyzerFunction
+  QueueUrl:
+    Description: Queue receiving the reports
+    Value: !Ref ReportsQueue
+  DeadLetterQueueUrl:
+    Description: Unprocessed infrastructure deliveries; no consumer is attached
+    Value: !Ref DeadLetterQueue
+  ResultsBucketName:
+    Description: Private storage for inputs, results and measurement exports
+    Value: !Ref ResultsBucket
+  SynthesizerLogGroupName:
+    Description: Log group containing application records and Lambda REPORT lines
+    Value: !Ref AnalyzerLogGroup
+  VoiceId:
+    Description: Shared Spanish voice for standard and neural synthesis
+    Value: Lupe
+  SampleRate:
+    Description: Shared MP3 and PCM sample rate in Hz
+    Value: '16000'
+  MeasurementsQueryName:
+    Description: Saved Logs Insights query for correlated invocation measurements
+    Value: !Sub '${AWS::StackName}-measurements'
